@@ -1,0 +1,553 @@
+diff --git a/src/speculators/data_generation/preprocessing.py b/src/speculators/data_generation/preprocessing.py
+index 8dffffe..b248205 100644
+--- a/src/speculators/data_generation/preprocessing.py
++++ b/src/speculators/data_generation/preprocessing.py
+@@ -221,6 +221,7 @@ def _encode_render(
+     add_generation_prompt: bool,
+     max_length: int,
+     tools: list[dict] | None = None,
++    chat_template_kwargs: dict | None = None,
+ ) -> list[int]:
+     """Render a conversation prefix via vLLM, bounded to the training window."""
+     messages = _adapt_conv_for_vllm(conv_prefix)
+@@ -229,6 +230,7 @@ def _encode_render(
+         messages,
+         add_generation_prompt=add_generation_prompt,
+         tools=tools,
++        chat_template_kwargs=chat_template_kwargs,
+         truncate_prompt_tokens=max_length,
+         truncation_side="right",
+     )
+@@ -249,6 +251,7 @@ def _render_boundary_rows(
+     max_length: int,
+     *,
+     tools: list[dict] | None = None,
++    chat_template_kwargs: dict | None = None,
+ ) -> list[BoundaryRow]:
+     """Build one training row per assistant turn, masked at its render boundary.
+ 
+@@ -280,6 +283,7 @@ def _render_boundary_rows(
+             add_generation_prompt=True,
+             max_length=max_length,
+             tools=tools,
++            chat_template_kwargs=chat_template_kwargs,
+         )
+         if len(prompt_ids) >= max_length:
+             # Not a break: templates that strip history reasoning (Qwen3,
+@@ -292,6 +296,7 @@ def _render_boundary_rows(
+             add_generation_prompt=False,
+             max_length=max_length,
+             tools=tools,
++            chat_template_kwargs=chat_template_kwargs,
+         )
+         if full_ids[: len(prompt_ids)] == prompt_ids:
+             boundary = len(prompt_ids)
+@@ -305,6 +310,7 @@ def _render_boundary_rows(
+                 add_generation_prompt=False,
+                 max_length=max_length,
+                 tools=tools,
++                chat_template_kwargs=chat_template_kwargs,
+             )
+             if full_ids[: len(hist_ids)] != hist_ids or boundary < len(hist_ids):
+                 raise BoundaryUnstableError(
+@@ -346,12 +352,33 @@ def _parse_conv_tools(conv_tools: object, idx: int) -> list | None:
+         return None
+ 
+ 
++def _parse_conv_template_kwargs(conv_kwargs: object, idx: int) -> dict | None:
++    """Parse the chat_template_kwargs JSON string (e.g. ``{"enable_thinking":
++    false}``) for one conversation; warn and return None on invalid input."""
++    if not conv_kwargs:
++        return None
++    if isinstance(conv_kwargs, dict):
++        return conv_kwargs
++    try:
++        parsed = json.loads(conv_kwargs) if isinstance(conv_kwargs, str) else None
++    except json.JSONDecodeError:
++        parsed = None
++    if not isinstance(parsed, dict):
++        log.warning(
++            f"Invalid chat_template_kwargs for conversation {idx}, "
++            "proceeding without them"
++        )
++        return None
++    return parsed
++
++
+ def _render_conversation_rows(
+     conv: list[dict],
+     conv_tools: object,
+     idx: int,
+     render_endpoint: str,
+     max_length: int,
++    conv_template_kwargs: object = None,
+ ) -> list[BoundaryRow] | None:
+     """Render one valid conversation; return ``None`` when it is unusable."""
+     if not conv or not isinstance(conv, list):
+@@ -368,6 +395,7 @@ def _render_conversation_rows(
+             render_endpoint,
+             max_length,
+             tools=parsed_tools,
++            chat_template_kwargs=_parse_conv_template_kwargs(conv_template_kwargs, idx),
+         )
+     # One row the render endpoint or boundary derivation can't handle must
+     # not kill the run. The failure modes can't be enumerated -- templates
+@@ -525,6 +553,16 @@ def _preprocess_batch(
+         )
+         tools_col = None
+ 
++    # Optional per-conversation chat_template_kwargs (JSON string), e.g. to render
++    # a role that is served with thinking disabled.
++    kwargs_col = examples.get("chat_template_kwargs")
++    if kwargs_col is not None and len(kwargs_col) != len(conversations):
++        log.warning(
++            f"chat_template_kwargs column length ({len(kwargs_col)}) does not match "
++            f"conversations length ({len(conversations)}), proceeding without them"
++        )
++        kwargs_col = None
++
+     num_unsupervised = 0
+     num_maybe_truncated = 0
+     num_convs_in = 0
+@@ -538,6 +576,7 @@ def _preprocess_batch(
+             idx,
+             render_endpoint,
+             max_length,
++            conv_template_kwargs=kwargs_col[idx] if kwargs_col is not None else None,
+         )
+         if rows is None:
+             continue
+diff --git a/src/speculators/models/dflash/metrics.py b/src/speculators/models/dflash/metrics.py
+index 66ec7b9..7f7836d 100644
+--- a/src/speculators/models/dflash/metrics.py
++++ b/src/speculators/models/dflash/metrics.py
+@@ -110,4 +110,15 @@ def compute_metrics(
+     )
+     metrics["eal_sum"] = eal_sum
+     metrics["eal_total"] = eal_total
++
++    # vLLM-style cumulative acceptance per draft slot: slot k counts only when
++    # slots 1..k are all correct (spec_decode_num_accepted_tokens_per_pos / drafts),
++    # unlike position_{k}_acc, which scores each slot on its own.
++    correct_blocks = (pred_ids == target_ids).reshape(-1, block_size)[:, start_pos:]
++    valid_blocks = loss_mask.to(torch.bool).reshape(-1, block_size)[:, start_pos:]
++    run = torch.logical_and(correct_blocks, valid_blocks).to(torch.float32).cumprod(dim=-1)
++    block_valid = valid_blocks.any(dim=-1).to(torch.float32)
++    for k in range(run.shape[-1]):
++        metrics[f"accept_pos_{k + 1}_sum"] = (run[:, k] * block_valid).sum()
++        metrics[f"accept_pos_{k + 1}_total"] = block_valid.sum()
+     return loss, metrics
+diff --git a/src/speculators/models/mtp/core.py b/src/speculators/models/mtp/core.py
+index edc6c04..8c3144e 100644
+--- a/src/speculators/models/mtp/core.py
++++ b/src/speculators/models/mtp/core.py
+@@ -1,6 +1,7 @@
+ """MTP speculator model implementation."""
+ 
+ import logging
++import os
+ from typing import Any, ClassVar
+ 
+ import torch
+@@ -29,6 +30,94 @@ _QWEN3_5_MROPE_POSITION_ID_RANK = 3
+ _QWEN3_5_MROPE_SECTIONS = 3
+ 
+ 
++def _mtp_ttt_enabled() -> bool:
++    return os.environ.get("SPECULATORS_MTP_TTT", "0").lower() in ("1", "true", "yes")
++
++
++def _mtp_postnorm_enabled() -> bool:
++    return os.environ.get("SPECULATORS_MTP_POSTNORM", "0").lower() in ("1", "true", "yes")
++
++
++def _load_verifier_final_norm(verifier: str) -> torch.Tensor:
++    """Read the verifier's final (pre-LM-head) norm weight from its checkpoint."""
++    import json  # noqa: PLC0415
++
++    from huggingface_hub import hf_hub_download  # noqa: PLC0415
++    from safetensors import safe_open  # noqa: PLC0415
++
++    def path(name: str) -> str:
++        local = os.path.join(verifier, name)
++        return local if os.path.exists(local) else hf_hub_download(verifier, name)
++
++    weight_map = json.load(open(path("model.safetensors.index.json")))["weight_map"]  # noqa: SIM115
++    for key in ("model.language_model.norm.weight", "model.norm.weight"):
++        if key in weight_map:
++            with safe_open(path(weight_map[key]), "pt") as f:
++                return f.get_tensor(key)
++    raise KeyError(f"no final norm weight found in {verifier}")
++
++
++class _TTTCache:
++    """Minimal cache for the HF attention's `past_key_values.update` call.
++
++    Returns the frozen prefix (step-0 "context" KV plus earlier draft steps' KV)
++    concatenated with this step's KV, and keeps this step's KV so the caller can
++    append it for later steps. Stateless across calls, so a gradient-checkpoint
++    recompute of the same step returns identical tensors.
++    """
++
++    def __init__(self, keys: list[torch.Tensor], values: list[torch.Tensor]) -> None:
++        self.prefix_k, self.prefix_v = keys, values
++        self.new_k: torch.Tensor | None = None
++        self.new_v: torch.Tensor | None = None
++
++    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):  # noqa: ARG002
++        self.new_k, self.new_v = key_states, value_states
++        if not self.prefix_k:
++            return key_states, value_states
++        return (
++            torch.cat([*self.prefix_k, key_states], dim=-2),
++            torch.cat([*self.prefix_v, value_states], dim=-2),
++        )
++
++
++# head_dim 256 flex kernels exceed the ~100 KB shared memory of Ada GPUs (L40S)
++# with default tiles; small tiles and a single stage fit.
++_FLEX_KERNEL_OPTIONS = {
++    "BLOCK_M": 32, "BLOCK_N": 32, "num_stages": 1,
++    "BLOCK_M1": 16, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 16,
++}
++
++
++def _ttt_block_mask(doc: torch.Tensor, n: int, step: int):
++    """Flex mask for draft step `step` (0-based) over KV = [step-0 KV | step 1..step KV].
++
++    Mirrors vLLM's MTP proposer: the context KV in the cache was written by the
++    first pass from verifier hidden states, and each later draft position adds
++    its own KV. So the query for anchor t sees step-0 keys at positions <= t
++    (same document) plus its own anchor's keys from steps 1..step, and nothing
++    from other anchors' draft chains.
++    """
++    from torch.nn.attention.flex_attention import create_block_mask  # noqa: PLC0415
++
++    def mask_mod(b, h, q_idx, kv_idx):  # noqa: ARG001
++        blk = kv_idx // n
++        j = kv_idx % n
++        context = (blk == 0) & (j <= q_idx) & (doc[j] == doc[q_idx])
++        own_chain = (blk > 0) & (j == q_idx)
++        return context | own_chain
++
++    return create_block_mask(
++        mask_mod,
++        B=None,
++        H=None,
++        Q_LEN=n,
++        KV_LEN=n * (step + 1),
++        device=doc.device,
++        _compile=True,  # blockwise; eager materializes the dense Q x KV mask (~8 GB at 12k x 98k)
++    )
++
++
+ def _prepare_mtp_position_ids(
+     position_ids: torch.Tensor,
+     valid_len: int,
+@@ -96,6 +185,12 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+     """
+ 
+     config_class: ClassVar[type[MTPSpeculatorConfig]] = MTPSpeculatorConfig  # type: ignore[misc]
++    # The MTP layer mixes into the HF decoder layer, which is a
++    # GradientCheckpointingLayer; HF defaults to use_reentrant=False, so the
++    # keyword-only call in forward() still propagates gradients. Needed for
++    # many speculative steps x long sequences, where each step's activations
++    # are otherwise all kept for backward.
++    supports_gradient_checkpointing = True
+     _keys_to_ignore_on_save: ClassVar[list[str]] = [  # type: ignore[misc,assignment]
+         "embed_tokens.weight",
+         "lm_head.weight",
+@@ -153,9 +248,78 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+         super().load_verifier_weights()
+         del self.verifier_lm_head
+ 
++    def _verifier_final_norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Apply the verifier's final RMSNorm to the extracted hidden states.
++
++        The hidden states come from vLLM's aux capture at the last layer
++        (`hidden + residual`, before the final norm), but vLLM's MTP proposer feeds
++        the MTP head the verifier's *output* hidden states, i.e. after the final
++        norm. Weight is loaded lazily from the verifier checkpoint and kept out
++        of the module tree, so it is neither trained nor saved.
++        """
++        weight = self.__dict__.get("_vfn_weight")
++        if weight is None:
++            weight = _load_verifier_final_norm(
++                self.config.speculators_config.verifier.name_or_path
++            ).to(hidden_states.device)
++            self.__dict__["_vfn_weight"] = weight
++        eps = self.config.transformer_layer_config.rms_norm_eps
++        x = hidden_states.float()
++        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
++        if self.config.transformer_layer_config.model_type in _QWEN3_5_MODEL_TYPES:
++            x = x * (1.0 + weight.float())  # Qwen3.5 RMSNorm is zero-centered
++        else:
++            x = x * weight.float()
++        return x.to(hidden_states.dtype)
++
++    def _head_ce(
++        self, hidden: torch.Tensor, targets: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """LM head + unreduced cross entropy; also returns the greedy prediction.
++
++        Not compiled: the number of supervised positions changes every batch,
++        and a `dynamic=False` compile would recompile on each new size.
++        """
++        logits = self.lm_head(hidden)
++        loss = nn.functional.cross_entropy(logits.float(), targets, reduction="none")
++        return loss, logits.argmax(dim=-1)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        hidden_states: torch.Tensor,
++        attention_mask: torch.Tensor | None = None,
++        position_ids: torch.Tensor | None = None,
++        loss_mask: torch.Tensor | None = None,
++        step_weights: list[float] | None = None,
++        return_dict: bool = True,
++        **kwargs: Any,
++    ) -> tuple:
++        """Dispatch to the vLLM-aligned TTT forward or the FastMTP recursive one.
++
++        SPECULATORS_MTP_TTT=1 selects TTT, whose multi-step attention matches
++        vLLM's MTP proposer (see `_forward_ttt`).
++        """
++        if _mtp_postnorm_enabled():
++            hidden_states = self._verifier_final_norm(hidden_states)
++        if _mtp_ttt_enabled():
++            return self._forward_ttt(
++                input_ids, hidden_states, position_ids, loss_mask, step_weights
++            )
++        return self._forward_recursive(
++            input_ids,
++            hidden_states,
++            attention_mask=attention_mask,
++            position_ids=position_ids,
++            loss_mask=loss_mask,
++            step_weights=step_weights,
++            return_dict=return_dict,
++            **kwargs,
++        )
++
+     # requires `dynamic=False`. See #876
+     @conditional_torch_compile(dynamic=False)
+-    def forward(
++    def _forward_recursive(
+         self,
+         input_ids: torch.Tensor,
+         hidden_states: torch.Tensor,
+@@ -236,6 +400,8 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+         )
+ 
+         current_hidden = hidden_states
++        anchors: torch.Tensor | None = None  # positions whose step-0 target is supervised
++        run_correct: torch.Tensor | None = None  # steps 1..k all correct (vLLM-style)
+         for step in range(effective_steps):
+             step_hidden = current_hidden[:, :valid_len]
+             step_embeds = self.embed_tokens(
+@@ -251,26 +417,47 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+                 position_embeddings=step_pos_emb,
+             )
+ 
+-            logits = self.lm_head(mtp_output)
+-            all_logits.append(logits)
+-
+             step_targets = input_ids[:, step + 2 : step + 2 + valid_len]
+             if loss_mask is not None:
+-                step_mask = loss_mask[:, step + 2 : step + 2 + valid_len]
+-                step_targets = step_targets.clone()
+-                step_targets[step_mask == 0] = _IGNORE_INDEX
++                step_mask = loss_mask[:, step + 2 : step + 2 + valid_len].bool()
++            else:
++                step_mask = torch.ones_like(step_targets, dtype=torch.bool)
++
++            # Only supervised positions need logits: the full LM head output is
++            # seq_len x vocab per step (~8 GB at 16k x 248k in bf16). Even the
++            # supervised slice (~1k x 248k, plus its fp32 copy inside the loss) adds
++            # up across many steps, so LM head + CE are recomputed in backward
++            # instead of keeping logits alive. The loss is identical either way.
++            # Returns per-step greedy draft tokens [num_supervised] instead of logits.
++            sel_targets = step_targets[step_mask]
++            if torch.is_grad_enabled():
++                unreduced, sel_pred = torch.utils.checkpoint.checkpoint(
++                    self._head_ce, mtp_output[step_mask], sel_targets, use_reentrant=False
++                )
++            else:
++                unreduced, sel_pred = self._head_ce(mtp_output[step_mask], sel_targets)
++            all_logits.append(sel_pred)
++
+             weight = step_weights[step] if step_weights is not None else 1.0
+-            unreduced = nn.functional.cross_entropy(
+-                logits.permute(0, 2, 1),
+-                step_targets,
+-                ignore_index=_IGNORE_INDEX,
+-                reduction="none",
+-            )
+-            valid_count = (step_targets != _IGNORE_INDEX).sum()
++            valid_count = step_mask.sum()
+             step_loss = weight * unreduced.sum() / valid_count.clamp(min=1)
+             total_loss = total_loss + step_loss
+             metrics[f"loss_step_{step}"] = step_loss.detach().clone()
+ 
++            with torch.no_grad():
++                correct = torch.zeros_like(step_mask)
++                correct[step_mask] = sel_pred == sel_targets
++                if anchors is None:
++                    anchors = step_mask
++                run_correct = correct if run_correct is None else run_correct & correct
++                # Teacher-forced step inputs equal the drafted tokens whenever all
++                # earlier steps are correct, so this cumulative rate matches vLLM's
++                # spec_decode_num_accepted_tokens_per_pos / num_drafts.
++                metrics[f"accept_pos_{step + 1}_sum"] = (run_correct & anchors).sum().float()
++                metrics[f"accept_pos_{step + 1}_total"] = anchors.sum().float()
++                metrics[f"step_{step + 1}_acc_sum"] = correct.sum().float()
++                metrics[f"step_{step + 1}_acc_total"] = step_mask.sum().float()
++
+             current_hidden = mtp_output
+ 
+         metrics["loss_sum"] = total_loss.detach().clone()
+@@ -278,6 +465,119 @@ class MTPDraftModel(DraftVocabMixin, SpeculatorModel):
+ 
+         return (all_logits, total_loss, metrics)
+ 
++    def _forward_ttt(
++        self,
++        input_ids: torch.Tensor,
++        hidden_states: torch.Tensor,
++        position_ids: torch.Tensor | None,
++        loss_mask: torch.Tensor | None,
++        step_weights: list[float] | None,
++    ) -> tuple:
++        """Multi-step MTP forward aligned with vLLM's MTP proposer (training-time test).
++
++        Differences from `_forward_recursive` (FastMTP style), both matching vLLM:
++        - Attention at step k >= 1 sees the step-0 KV (computed from verifier
++          hidden states) for context positions <= anchor, plus only its own
++          anchor's KV from earlier draft steps -- not a sequence-wide recursion.
++        - Draft step k runs at position anchor + k (vLLM advances positions per
++          draft step; `constant_draft_positions` is False for MTP).
++        Targets, step weights, loss and metrics are identical to the recursive path.
++        """
++        input_ids = input_ids.long()
++        device = input_ids.device
++        batch_size, seq_len = input_ids.shape
++        if batch_size != 1:
++            raise ValueError("TTT MTP forward expects packed batches of size 1")
++        num_steps = self.config.num_speculative_steps
++        if step_weights is not None and len(step_weights) != num_steps:
++            raise ValueError(
++                f"step_weights has {len(step_weights)} entries but "
++                f"num_speculative_steps={num_steps}"
++            )
++        if position_ids is None:
++            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
++
++        all_preds: list[torch.Tensor] = []
++        total_loss = torch.tensor(0.0, device=device)
++        metrics: dict[str, float | torch.Tensor] = {}
++        effective_steps = min(num_steps, max(0, seq_len - 2))
++        n = seq_len - effective_steps - 1
++        if n <= 0 or effective_steps == 0:
++            metrics["loss_sum"] = total_loss.detach().clone()
++            metrics["loss_total"] = torch.tensor(1.0, device=device)
++            return (all_preds, total_loss, metrics)
++
++        model_type = self.config.transformer_layer_config.model_type
++        text_pos, rotary_pos = _prepare_mtp_position_ids(position_ids, n, model_type)
++        doc = torch.cumsum((text_pos[0] == 0).to(torch.int32), dim=0)  # packed docs restart at 0
++
++        layer = self.mtp_layers[0]
++        # Stays flex for the rest of the run (no restore): gradient-checkpoint
++        # recompute happens in backward, after this forward has returned.
++        layer.self_attn.config._attn_implementation = "flex_attention"  # noqa: SLF001
++        # The cache is read-only per step (see _TTTCache), so it is safe to keep it
++        # under gradient checkpointing.
++        layer._can_checkpoint_with_cache = True  # noqa: SLF001
++
++        kv_k: list[torch.Tensor] = []
++        kv_v: list[torch.Tensor] = []
++        anchors: torch.Tensor | None = None
++        run_correct: torch.Tensor | None = None
++        current_hidden = hidden_states[:, :n]
++        for step in range(effective_steps):
++            step_text_pos = text_pos + step
++            step_rotary_pos = rotary_pos + step
++            step_embeds = self.embed_tokens(input_ids[:, step + 1 : step + 1 + n])
++            pos_emb = self.rotary_emb(current_hidden, step_rotary_pos)
++            cache = _TTTCache(kv_k, kv_v)
++            mtp_output = layer(
++                hidden_states=current_hidden,
++                token_embeddings=step_embeds,
++                attention_mask=_ttt_block_mask(doc, n, step),
++                position_ids=step_text_pos,
++                position_embeddings=pos_emb,
++                past_key_values=cache,
++                kernel_options=_FLEX_KERNEL_OPTIONS,
++            )
++            kv_k = [*kv_k, cache.new_k]
++            kv_v = [*kv_v, cache.new_v]
++
++            step_targets = input_ids[:, step + 2 : step + 2 + n]
++            if loss_mask is not None:
++                step_mask = loss_mask[:, step + 2 : step + 2 + n].bool()
++            else:
++                step_mask = torch.ones_like(step_targets, dtype=torch.bool)
++            sel_targets = step_targets[step_mask]
++            if torch.is_grad_enabled():
++                unreduced, sel_pred = torch.utils.checkpoint.checkpoint(
++                    self._head_ce, mtp_output[step_mask], sel_targets, use_reentrant=False
++                )
++            else:
++                unreduced, sel_pred = self._head_ce(mtp_output[step_mask], sel_targets)
++            all_preds.append(sel_pred)
++
++            weight = step_weights[step] if step_weights is not None else 1.0
++            step_loss = weight * unreduced.sum() / step_mask.sum().clamp(min=1)
++            total_loss = total_loss + step_loss
++            metrics[f"loss_step_{step}"] = step_loss.detach().clone()
++
++            with torch.no_grad():
++                correct = torch.zeros_like(step_mask)
++                correct[step_mask] = sel_pred == sel_targets
++                if anchors is None:
++                    anchors = step_mask
++                run_correct = correct if run_correct is None else run_correct & correct
++                metrics[f"accept_pos_{step + 1}_sum"] = (run_correct & anchors).sum().float()
++                metrics[f"accept_pos_{step + 1}_total"] = anchors.sum().float()
++                metrics[f"step_{step + 1}_acc_sum"] = correct.sum().float()
++                metrics[f"step_{step + 1}_acc_total"] = step_mask.sum().float()
++
++            current_hidden = mtp_output
++
++        metrics["loss_sum"] = total_loss.detach().clone()
++        metrics["loss_total"] = torch.tensor(1.0, device=device)
++        return (all_preds, total_loss, metrics)
++
+     @classmethod
+     def from_training_args(  # type: ignore[override]
+         cls,
+diff --git a/src/speculators/train/trainer.py b/src/speculators/train/trainer.py
+index 01ed9e5..70b024d 100644
+--- a/src/speculators/train/trainer.py
++++ b/src/speculators/train/trainer.py
+@@ -592,6 +592,19 @@ class Trainer:
+                 # Avoid saving back to back ay the end of each epoch
+             ):
+                 self.maybe_save_checkpoint(epoch, local_step=local_step)
++                # Validate at every sub-epoch checkpoint too, so the trend is visible
++                # within an epoch (val_epoch leaves the model in eval mode).
++                if self.val_loader is not None:
++                    if self.is_distributed:
++                        dist.barrier()
++                    root_logger.info(
++                        f"Validation at step {local_step}/{num_steps} of epoch "
++                        f"{epoch + 1} started"
++                    )
++                    self.val_epoch(epoch)
++                    self.model.train()
++                    if self.is_distributed:
++                        dist.barrier()
+ 
+     def _maybe_val_sync(self, batch_index: int) -> None:
+         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:

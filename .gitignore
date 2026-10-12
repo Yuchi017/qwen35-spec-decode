@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+bench/data/
+bench/logs/
+bench/results/*.json
+training/data/
+training/logs/
+training/ckpt/
+training/state/
+training/results/
+token_space/
