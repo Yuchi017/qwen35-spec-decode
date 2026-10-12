@@ -39,7 +39,7 @@ Model: Qwen/Qwen3.5-4B with its native MTP head. Workload: Spec-Bench, all 480 p
 | Stock spec-decode kernels | 2527 | 11.61 ms | 205 ms | 3.94 |
 | GDN RecoverSSM | **2789 (+10.4%)** | 10.55 ms | 188 ms | 3.94 |
 
-A K × concurrency sweep and the public MTP-finetuning reproduction are in progress; results will land in [`results/`](results/).
+In a K × concurrency sweep at c=32, RecoverSSM gave +16% at K=3 (the fastest configuration, 3004 tok/s), +7% at K=5 and +11% at K=7. It gave no gain at c=1 and slightly negative results at K=1. Full table: [`results/`](results/README.md). The public MTP-finetuning reproduction is in progress.
 
 ## 1. GDN RecoverSSM
 

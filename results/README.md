@@ -11,7 +11,22 @@ BF16 weights and KV. All 480 Spec-Bench prompts at c=32, 256 output tokens, temp
 | Stock kernels | 2527 | 11.61 | 205 | 3.940 |
 | RecoverSSM | 2789 | 10.55 | 188 | 3.943 |
 
-K ∈ {1, 3, 5, 7} × c ∈ {1, 8, 32} sweep: _in progress._
+### K × concurrency sweep
+
+Output tok/s, stock → RecoverSSM. Each server ran c=1 (80 prompts), then c=8 (240), then c=32 (480), with prefix caching on. Single run per cell.
+
+| K | c=1 | c=8 | c=32 |
+|---|---|---|---|
+| 1 | 117 → 116 (−1%) | 760 → 748 (−2%) | 2062 → 2010 (−3%) |
+| 3 | 151 → 150 (−1%) | 909 → 985 (+8%) | 2583 → **3004 (+16%)** |
+| 5 | 152 → 151 (−1%) | 929 → 946 (+2%) | 2665 → 2847 (+7%) |
+| 7 | 140 → 142 (+1%) | 891 → 921 (+3%) | 2436 → 2693 (+11%) |
+
+Accept length is unchanged in every cell; for example, K=5 at c=32 is 3.936 → 3.927, with per-position accept .855 .692 .558 .456 .375 → .855 .692 .556 .453 .372.
+
+- The gain grows with concurrency, because the per-position state write-back that RecoverSSM removes scales with batch size. At c=1 there is no gain.
+- At K=1, only one draft position's write is saved, and the fixed commit cost makes it slightly slower. Do not enable RecoverSSM at K=1.
+- The K=5, c=32 cell differs from the standalone run above (+7% here vs. +10%), because here the server had already served the c=1 and c=8 runs, which changes prefix-cache state for both arms. Expect about ±4% run-to-run.
 
 ## Internal agent workload (anonymized)
 
